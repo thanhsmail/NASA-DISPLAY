@@ -1,107 +1,133 @@
 #include <Arduino.h>
-#include <EEPROM.h>
-#include "MinMaxEEPROM.h"
 #include "DisplayManager.h"
-#include "PacketParser.h"
 #include "DualButtonProgress.h"
+#include "PacketParser.h"
 #include "voice.h"
-#define RXD2 20
-#define TXD2 21
-#define BTN_OK   5
-#define BTN_DOWN  3
-#define BTN_UP    8
+#include "MinMaxEEPROM.h"
 
-//HardwareSerial SerialRS232(1);
-String buffer = ""; 
-
+// ==== Biến toàn cục ====
 DisplayManager displayMgr;
-DualButtonProgress dbp(BTN_OK, BTN_DOWN, BTN_UP, &displayMgr);
+DualButtonProgress* dualBtn;
+ParsedData g_data;
+SemaphoreHandle_t dataMutex;
 
-int screenChangeCount = 0;
+HardwareSerial RS232Serial(1);  // UART1 cho RS232
 
-void changeScreenCallback() {
-  screenChangeCount++;
-  if (screenChangeCount == 3) {
-    displayMgr.setScreen(SCREEN_SETTINGS);
-    screenChangeCount = 0;
-  } else {
-    int idx = displayMgr.getScreenIndex();
-    if (idx == SCREEN_SETTINGS) {
-      displayMgr.setScreen(0);
-    } else {
-      displayMgr.nextScreen();
+// ================= TASKS =================
+
+// Task hiển thị TFT
+void displayTask(void* pv) {
+  for (;;) {
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      if (displayMgr.getScreenIndex() == SCREEN_SETTINGS) {
+        // lấy mục đang chọn từ DisplayManager (nguồn sự thật)
+        int sel = displayMgr.getSettingsSelectedField();
+        displayMgr.displaySettings(displayMgr.tempMin, displayMgr.tempMax, sel);
+      } else {
+        displayMgr.display(g_data);
+      }
+      xSemaphoreGive(dataMutex);
     }
+    vTaskDelay(pdMS_TO_TICKS(150)); // update nhanh hơn để cảm nhận tức thì khi đổi màu
   }
 }
 
-void setup() {
-    Serial.begin(115200);
-  #if defined(ESP8266) || defined(ESP32)
-  EEPROM.begin(512);
-  #endif
-  //SerialRS232.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  Serial0.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  Serial.println("HELLO NASA!");
-  setupVoiceAlert();
+// Task nút nhấn
+void buttonTask(void* pv) {
+  for (;;) {
+    dualBtn->update();
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
 
-  // Đọc MIN/MAX từ EEPROM khi khởi động
-  loadMinMaxFromEEPROM(displayMgr.tempMin, displayMgr.tempMax);
+// Task âm thanh
+void voiceTask(void* pv) {
+  for (;;) {
+    loopVoiceAlert();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// Task cảnh báo lái xe
+void drivingAlertTask(void* pv) {
+  for (;;) {
+    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+      if (g_data.speed > 3) {  // xe đang chạy
+        if (g_data.continuousDrive >= 240) playVoiceAlertDrive4h();
+        else if (g_data.continuousDrive >= 225) playVoiceAlertSoon4h();
+
+        if (g_data.dailyDrive >= 600) playVoiceAlertDrive10h();
+        else if (g_data.dailyDrive >= 585) playVoiceAlertSoon10h();
+      }
+      xSemaphoreGive(dataMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// Task đọc dữ liệu RS232
+void rs232Task(void* pv) {
+  String packet;
+  for (;;) {
+    while (RS232Serial.available()) {
+      char c = RS232Serial.read();
+      if (c == '\n') {
+        ParsedData d = parsePacket(packet);
+        if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+          g_data = d;
+          xSemaphoreGive(dataMutex);
+        }
+        packet = "";
+      } else {
+        packet += c;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);  // debug
+  EEPROM.begin(64);
 
   displayMgr.init();
-  displayMgr.showLogo();
+  setupVoiceAlert();
 
-  dbp.begin();
-  dbp.setHoldTime(2000);
-  dbp.onComplete(changeScreenCallback);
-  String fakePacket3 = "!NASA,1,2025-07-27 21:00:00,99,-10.69,HO VA TEN,GPLX123456,30,630,1,123";
-  ParsedData fakeData3 = parsePacket(fakePacket3);
-  Serial.println(fakePacket3);
-  displayMgr.display(fakeData3);
+  // Load min/max từ EEPROM
+  loadMinMaxFromEEPROM(displayMgr.tempMin, displayMgr.tempMax);
+
+  // Nút nhấn: BTN_OK=GPIO8, BTN_DOWN=GPIO3, BTN_UP=GPIO5
+  dualBtn = new DualButtonProgress(8, 3, 5, &displayMgr);
+  dualBtn->begin();
+  dualBtn->setHoldTime(1000);
+  dualBtn->onComplete([]() {
+    displayMgr.nextScreen();
+  });
+
+  dataMutex = xSemaphoreCreateMutex();
+
+  // Giá trị mặc định
+  g_data.timestamp = "2025-09-19 12:00:00";
+  g_data.speed = 0;
+  g_data.temperature = 25.0;
+  g_data.driverName = "Nguyen";
+  g_data.licenseID = "51A-12345";
+  g_data.continuousDrive = 0;
+  g_data.dailyDrive = 0;
+  g_data.engineOn = true;
+
+  // RS232: UART1 (GPIO20 RX, GPIO21 TX) → chỉnh theo phần cứng
+  RS232Serial.begin(9600, SERIAL_8N1, 20, 21);
+
+  // ==== Tạo task FreeRTOS ====
+  xTaskCreate(displayTask,     "Display", 4096, NULL, 1, NULL);
+  xTaskCreate(buttonTask,      "Buttons", 2048, NULL, 1, NULL);
+  xTaskCreate(voiceTask,       "Voice",   4096, NULL, 1, NULL);
+  xTaskCreate(drivingAlertTask,"Alert",   4096, NULL, 1, NULL);
+  xTaskCreate(rs232Task,       "RS232",   4096, NULL, 1, NULL);
 }
 
 void loop() {
-  handleVirtualSerialInput();
-  dbp.update();
-
-  if (Serial.available() && displayMgr.getScreenIndex() != SCREEN_SETTINGS) {
-    String packet = Serial.readStringUntil('\r');
-    ParsedData info = parsePacket(packet);
-    displayMgr.display(info);
-  }
-
-  while (Serial0.available()&& displayMgr.getScreenIndex() != SCREEN_SETTINGS) {
-    char c = Serial0.read();
-    if (c == '\n' || c == '\r') {
-      if (buffer.length() > 0) {
-        buffer.trim();
-        Serial.println("Received: " + buffer);
-        ParsedData info = parsePacket(buffer);
-        displayMgr.display(info);
-        buffer = "";
-      }
-    } else {
-      buffer += c;
-    }
-  }
-  loopVoiceAlert();
-  delay(50);
-}
-
-void handleVirtualSerialInput() {
-  if (Serial.available() && displayMgr.getScreenIndex() != SCREEN_SETTINGS) {
-    String packet = Serial.readStringUntil('\r');
-    if (packet.startsWith("!NASA")) {
-      Serial.println("[DEBUG] Received virtual packet: " + packet);
-      ParsedData info = parsePacket(packet);
-      // Cảnh báo khi nhiệt độ vượt ngoài set
-      if (info.temperature < displayMgr.tempMin) {
-        //playVoiceAlertLowTemp();
-        Serial.println("nhiet độ thấp");
-      } else if (info.temperature > displayMgr.tempMax) {
-         Serial.println("nhiet độ cao");
-        //playVoiceAlertHighTemp();
-      }
-      displayMgr.display(info);
-    }
-  }
+  // không dùng
 }
